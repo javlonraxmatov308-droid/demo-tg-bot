@@ -1,0 +1,151 @@
+# bot.py
+"""
+Telegram qidiruv-bot (o'zbekcha)
+Ishga tushirish:
+  1) pip install python-telegram-bot==20.6 requests beautifulsoup4 python-dotenv
+  2) BOT_TOKEN o'zgaruvchisiga token-ni o'rnating (export BOT_TOKEN="123:ABC..." yoki .env)
+  3) python bot.py
+"""
+
+import os
+import logging
+from telegram import (
+    Update,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InlineQueryResultArticle,
+    InputTextMessageContent,
+)
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+    CallbackQueryHandler,
+    InlineQueryHandler,
+)
+import requests
+from bs4 import BeautifulSoup
+from uuid import uuid4
+from dotenv import load_dotenv
+
+load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN muammo: .env yoki atrof-muhitda BOT_TOKEN mavjud emas")
+
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# --- Simple web search using DuckDuckGo HTML (no API needed)
+def duckduckgo_search(query, max_results=5):
+    """
+    DuckDuckGo sahifasini oddiy parse qiladi va topilgan linklar bilan qisqacha ma'lumot qaytaradi.
+    E'tibor: bu rasmiy API emas, juda oddiy parser.
+    """
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; Bot/1.0)"}
+    url = "https://html.duckduckgo.com/html/"
+    res = requests.post(url, data={"q": query}, headers=headers, timeout=10)
+    res.raise_for_status()
+    soup = BeautifulSoup(res.text, "html.parser")
+    results = []
+    # DuckDuckGo HTML markup: .result__a uchun sarlavha va url
+    for el in soup.select(".result__a")[:max_results]:
+        title = el.get_text(strip=True)
+        href = el.get("href")
+        # href ba'zan /l/?kh=...&uddg=<encoded url> — oddiy ishlatish uchun to'g'ridan-to'g'ri olamiz
+        results.append({"title": title, "link": href})
+    # fallback: agar hech narsa topilmasa Google qidiruv url sifatida yubor
+    if not results:
+        results.append({"title": "Qidiruv natijalari (DuckDuckGo bo'sh) — Google orqali", "link": f"https://www.google.com/search?q={requests.utils.quote(query)}"})
+    return results
+
+# --- Handlers
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    # Reply keyboard with a contact-request button and common commands
+    kb = [
+        [KeyboardButton("Kontaktni ulashish 📲", request_contact=True)],
+        [KeyboardButton("Qidiruv 🔍 (savol yozing)")]
+    ]
+    reply = ReplyKeyboardMarkup(kb, resize_keyboard=True)
+    text = f"Assalomu alaykum, {user.first_name or 'do'st'}! Men sizga yordam beruvchi botman. Kontaktni ulashish uchun pastdagi tugmani bosing yoki istalgan savolingizni yozing (kino, qo'shiq, video, sayt va hokazo)."
+    await update.message.reply_text(text, reply_markup=reply)
+
+async def contact_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # update.message.contact mavjud bo'ladi
+    contact = update.message.contact
+    if contact:
+        # Siz bu ma'lumotni bazaga yozishingiz yoki ishlatishingiz mumkin
+        name = contact.first_name or ""
+        phone = contact.phone_number or ""
+        await update.message.reply_text(f"Kontakt qabul qilindi: {name} — {phone}\nRahmat!")
+    else:
+        await update.message.reply_text("Kontakt olinmadi.")
+
+async def plain_text_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.message.text
+    # ba'zi sistem komandalarini chetga olish
+    if query.startswith("/"):
+        return
+    await update.message.reply_text(f"Qidirilmoqda: «{query}» — bir necha soniya kuting...")
+    try:
+        results = duckduckgo_search(query, max_results=5)
+    except Exception as e:
+        logger.exception("Search error")
+        await update.message.reply_text("Qidiruvda xatolik yuz berdi. Iltimos, keyinroq qayta urinib ko'ring.")
+        return
+
+    text = f"Topilgan natijalar — «{query}»:\n\n"
+    for r in results:
+        text += f"• {r['title']}\n{r['link']}\n\n"
+
+    # Share tugmasi misoli
+    share_url = f"https://t.me/share/url?url={requests.utils.quote(results[0]['link'])}&text={requests.utils.quote('Mana siz so‘ragan narsaning linki:')}"
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Ulashish do'stga 🔄", url=share_url)]])
+    await update.message.reply_text(text, reply_markup=keyboard)
+
+async def inline_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """@botname so'rovini inline rejimda qabul qiladi va natijalarni ko'rsatadi."""
+    query = update.inline_query.query
+    if not query:
+        return
+    try:
+        results = duckduckgo_search(query, max_results=5)
+    except Exception:
+        results = [{"title":"Qidiruvda xatolik","link":"https://duckduckgo.com/"}]
+
+    items = []
+    for r in results:
+        content = InputTextMessageContent(f"{r['title']}\n{r['link']}")
+        items.append(InlineQueryResultArticle(id=str(uuid4()), title=r['title'][:50], input_message_content=content, description=r['link']))
+    await update.inline_query.answer(items[:10], cache_time=120)
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Ishlatish: /start — boshlash. Istalgan savolingizni yozing: kino, qo'shiq, video, sayt va h.k. Kontakt yuborish uchun «Kontaktni ulashish» tugmasini bosing.")
+
+async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Afsuski, men bu buyruqni tushunmadim. Savolingizni oddiy qilib yozing yoki /help bosing.")
+
+def main():
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
+    # contact handler
+    app.add_handler(MessageHandler(filters.CONTACT, contact_handler))
+    # inline query
+    app.add_handler(InlineQueryHandler(inline_search))
+    # oddiy matn xabarlar — qidiruv sifatida qabul qilamiz
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, plain_text_search))
+    # unknown commands
+    app.add_handler(MessageHandler(filters.COMMAND, unknown))
+
+    logger.info("Bot ishga tushmoqda...")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
